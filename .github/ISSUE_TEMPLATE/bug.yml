@@ -1,0 +1,17 @@
+name: Bug report
+description: Something in the iPhone or watch app does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Security problems: please use **Security → Report a vulnerability** instead. Do not include tokens, server addresses or screenshots of a real server."
+  - type: textarea
+    id: what
+    attributes: { label: What happened, description: "What you did, what you expected, what happened instead." }
+    validations: { required: true }
+  - type: input
+    id: device
+    attributes: { label: Device and version, placeholder: "iPhone 16, iOS 26.1 / Apple Watch Series 10, watchOS 26.1" }
+  - type: input
+    id: build
+    attributes: { label: App build, placeholder: "Settings → About, or the TestFlight build number" }

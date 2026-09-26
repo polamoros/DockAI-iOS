@@ -1,0 +1,434 @@
+# Builds the DockAI iOS app on GitHub's macOS runners.
+#
+#   compile     every push: unsigned, so compile errors show with no secrets.
+#   simulator   when started by hand: the apps in the simulator, against a
+#               test server with invented data or (live=true) the real server
+#               as the UI test user; every screen photographed. Results go
+#               only to the DockAI server — nothing is uploaded here. It fails
+#               when a UI test fails.
+#   testflight  only when started by hand with testflight=true (Actions → iOS → Run workflow, or
+#               `gh workflow run ios.yml`), after compile, when the App Store
+#               Connect secrets are set:
+#               Xcode's automatic signing driven by the API key, then upload.
+#               Automatic signing makes a development profile while
+#               archiving, so the team needs one registered iPhone ("Your
+#               team has no devices"); the export re-signs for distribution.
+#
+# Secrets (Settings → Secrets and variables → Actions): ASC_KEY_ID,
+# ASC_ISSUER_ID, ASC_PRIVATE_KEY (the whole .p8), APPLE_TEAM_ID;
+# DOCKAI_TEST_SERVER (the server's https address). There is no test token
+# secret: each run trades GitHub's signed identity for the run (OIDC) for a
+# thirty-minute token, which the server issues only to this workflow on main,
+# started by hand by its owner.
+name: iOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: "Upload to TestFlight after the simulator run (review the screenshots first)"
+        type: boolean
+        default: false
+      live:
+        description: "Walk the apps against the real server as the UI test user"
+        type: boolean
+        default: false
+
+# A push supersedes an earlier push's compile; a manual run (the simulator,
+# a TestFlight upload) is never cancelled by one (audit M8).
+concurrency:
+  group: ios-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+# Least privilege by default; a job that needs more says so (audit M3).
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Use the newest Xcode (uploads need the iOS 26 SDK or later)
+        run: |
+          xc=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "available: $(ls -d /Applications/Xcode_*.app | xargs -n1 basename | tr '\n' ' ')"
+          sudo xcode-select -s "$xc"
+          xcodebuild -version
+      - name: Generate the Xcode project
+        run: |
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          ./generate.sh
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project DockAI.xcodeproj -scheme DockAI \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation -skipMacroValidation \
+            -IDEBuildingContinueBuildingAfterErrors=YES \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild.log | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" xcodebuild.log
+          # Say which targets were built: a target left out compiles nothing
+          # and fails nothing, so success alone does not prove it was built.
+          xcodebuild -list -project DockAI.xcodeproj | sed -n '/Targets:/,/Build Configurations:/p'
+          for t in DockAI DockAIWidgets DockAINotifications DockAIWatch DockAIWatchWidgets; do
+            echo "compiled in $t: $(grep -cE "SwiftCompile .*/$t/[A-Za-z]+\.swift|CompileSwift .*/$t/[A-Za-z]+\.swift" xcodebuild.log) Swift file steps"
+          done
+
+  # Walks the iPhone and watch apps in the simulator against a local server
+  # with invented data (ci/mock-server.mjs) and photographs every screen —
+  # the apps' design gate. Nothing real is involved, so the screenshots are
+  # safe as a public artifact. Runs before every TestFlight upload.
+  simulator:
+    needs: compile
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write   # GitHub's signed identity for this run, traded for a test token
+    env:
+      LIVE: ${{ inputs.live && '1' || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Use the newest Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          xcodebuild -version
+      - name: Generate the Xcode project
+        run: |
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          ./generate.sh
+      - name: A thirty-minute test token for this run
+        env:
+          SERVER: ${{ secrets.DOCKAI_TEST_SERVER }}
+        # GitHub signs who this run is (repository, branch, workflow, trigger,
+        # actor); the DockAI server checks that and answers with a token that
+        # dies in thirty minutes and reaches only the test user's project.
+        # Without the server secret, results stay on the runner.
+        run: |
+          [ -n "$SERVER" ] || { echo "No DOCKAI_TEST_SERVER secret: results stay on the runner."; exit 0; }
+          case "$SERVER" in https://*) ;; *) echo "DOCKAI_TEST_SERVER must be https"; exit 1;; esac
+          oidc=$(curl -sf --proto =https -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=dockai-ui-test" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+          answer=$(curl -sf --proto =https -X POST "$SERVER/api/ci/ui-token" -H "Content-Type: application/json" -d "{\"oidc\":\"$oidc\"}") || { echo "The server refused this run (see its logs, component ui-test)."; exit 1; }
+          token=$(printf %s "$answer" | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+          project=$(printf %s "$answer" | python3 -c "import json,sys; print(json.load(sys.stdin)['project'])")
+          echo "::add-mask::$token"
+          echo "UPLOAD_TOKEN=$token" >> "$GITHUB_ENV"
+          if [ "$LIVE" = 1 ]; then
+            {
+              echo "TEST_RUNNER_DOCKAI_TEST_SERVER=$SERVER"
+              echo "TEST_RUNNER_DOCKAI_TEST_TOKEN=$token"
+              echo "TEST_RUNNER_DOCKAI_TEST_PROJECT=$project"
+              echo "TEST_RUNNER_DOCKAI_LIVE=1"
+            } >> "$GITHUB_ENV"
+          fi
+          echo "test token issued (valid thirty minutes)"
+      - name: Start the test server
+        if: env.LIVE != '1'
+        run: |
+          nohup node ci/mock-server.mjs > ci/mock-server.log 2>&1 &
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:8787/api/health >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:8787/api/health
+      - name: Pick simulators
+        run: |
+          phone=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for k,v in sorted(d.items(), reverse=True) if 'iOS' in k for x in v if x['name'].startswith('iPhone')))")
+          watch=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next((x['udid'] for k,v in sorted(d.items(), reverse=True) if 'watchOS' in k for x in v if 'Watch' in x['name']), ''))")
+          echo "PHONE=$phone" >> "$GITHUB_ENV"; echo "WATCH=$watch" >> "$GITHUB_ENV"
+          xcrun simctl list devices available | grep -E "$phone|$watch" || true
+      - name: iPhone, light and dark
+        run: |
+          set -o pipefail
+          xcrun simctl boot "$PHONE" || true
+          for mode in light dark; do
+            xcrun simctl ui "$PHONE" appearance "$mode"
+            xcodebuild test -project DockAI.xcodeproj -scheme DockAI \
+              -destination "id=$PHONE" -resultBundlePath "results-phone-$mode.xcresult" \
+              -skipPackagePluginValidation -skipMacroValidation \
+              CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= > "test-phone-$mode.log" 2>&1 || true
+            # Counts only in the public log; the details go to the DockAI server.
+            passed=$(grep -c "Test Case .*passed" "test-phone-$mode.log" || true); failed=$(grep -c "Test Case .*failed" "test-phone-$mode.log" || true)
+            echo "$mode: $passed passed, $failed failed"
+            [ "$passed" -gt 0 ] && touch .ui-passed || true
+            [ "$failed" -gt 0 ] && echo "iPhone $mode: $failed" >> .ui-failed || true
+          done
+      - name: Watch
+        if: env.WATCH != ''
+        run: |
+          set -o pipefail
+          xcodebuild test -project DockAI.xcodeproj -scheme DockAIWatch \
+            -destination "id=$WATCH" -resultBundlePath results-watch.xcresult \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= > test-watch.log 2>&1 || true
+          passed=$(grep -c "Test Case .*passed" test-watch.log || true); failed=$(grep -c "Test Case .*failed" test-watch.log || true)
+          echo "watch: $passed passed, $failed failed"
+          [ "$failed" -gt 0 ] && echo "watch: $failed" >> .ui-failed || true
+      - name: Export the screenshots
+        if: always()
+        run: |
+          mkdir -p shots
+          for r in results-*.xcresult; do
+            [ -d "$r" ] || continue
+            out="shots/${r%.xcresult}"; mkdir -p "$out"
+            xcrun xcresulttool export attachments --path "$r" --output-path "$out" || true
+          done
+          cp ci/out/missing.json shots/missing-fixtures.json 2>/dev/null || true
+          cp ci/out/requests.log shots/requests.log 2>/dev/null || true
+          cp test-*.log shots/ 2>/dev/null || true
+          echo "$(find shots -type f | wc -l | tr -d ' ') files"
+      # No screenshot or log of any run is uploaded to this public
+      # repository. They go straight to the DockAI server with the UI test
+      # user's token (POST /api/devices/ui-results), where only an admin's
+      # worker reads them back; without that secret, a run keeps them on the
+      # runner and says only how many tests passed.
+      - name: Send the results to the server
+        if: always()
+        env:
+          SERVER: ${{ secrets.DOCKAI_TEST_SERVER }}
+        run: |
+          TOKEN="${UPLOAD_TOKEN:-}"
+          if [ -z "$SERVER" ] || [ -z "$TOKEN" ]; then
+            echo "No test token for this run: results stay on the runner."
+          else
+            tar czf screens.tgz shots
+            code=$(curl -s --proto =https -o /dev/null -w "%{http_code}" -X POST "$SERVER/api/devices/ui-results?run=$GITHUB_RUN_ID" \
+              -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/octet-stream" --data-binary @screens.tgz)
+            echo "sent to the server: HTTP $code"
+            [ "$code" = 200 ]
+          fi
+          rm -rf shots screens.tgz test-*.log results-*.xcresult
+      # The results are out first, then the verdict: a failed UI test fails
+      # the job, so a TestFlight upload never follows it (audit M2).
+      - name: Did every UI test pass?
+        run: |
+          [ -f .ui-failed ] && { echo "UI tests failed: $(cat .ui-failed)"; exit 1; }
+          [ -f .ui-passed ] || { echo "No UI test ran"; exit 1; }
+          echo "all UI tests passed"
+
+  testflight:
+    needs: [compile, simulator]
+    # Uploads only when started on purpose and asked for (the `testflight`
+    # input): a push only compiles, and a plain manual run only photographs
+    # the apps, so the screens are reviewed before a build ships.
+    if: github.event_name == 'workflow_dispatch' && inputs.testflight
+    # The App Store Connect secrets live in this environment, released only
+    # to main and only after the owner approves the run (audit H3).
+    environment: testflight
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HAS_KEY: ${{ secrets.ASC_PRIVATE_KEY != '' }}
+    steps:
+      - name: Secrets set?
+        if: env.HAS_KEY != 'true'
+        run: echo "No App Store Connect secrets yet — compile only." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: env.HAS_KEY == 'true'
+        with:
+          persist-credentials: false
+      - name: Use the newest Xcode (uploads need the iOS 26 SDK or later)
+        if: env.HAS_KEY == 'true'
+        run: |
+          xc=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "available: $(ls -d /Applications/Xcode_*.app | xargs -n1 basename | tr '\n' ' ')"
+          sudo xcode-select -s "$xc"
+          xcodebuild -version
+      - name: Generate the Xcode project
+        if: env.HAS_KEY == 'true'
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          ./generate.sh
+      - name: Check the App Store Connect key
+        if: env.HAS_KEY == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        # Says which part is wrong without printing any of it: the key's shape,
+        # then what Apple's API answers to a token signed with it. This log is
+        # public (a public repository's Actions logs are): no id fragments, no
+        # list of the team's other apps.
+        run: |
+          PYTHONPATH=ci python3 - <<'PY'
+          import os, time, json, urllib.request, urllib.error
+          from asc_jwt import token as sign_token
+          key = os.environ["ASC_PRIVATE_KEY"].strip()
+          lines = key.splitlines()
+          print(f"key: {len(lines)} lines, header ok: {lines[0] == '-----BEGIN PRIVATE KEY-----'}, footer ok: {lines[-1] == '-----END PRIVATE KEY-----'}")
+          print(f"key id length: {len(os.environ['ASC_KEY_ID'].strip())} (expect 10), issuer id length: {len(os.environ['ASC_ISSUER_ID'].strip())} (expect 36)")
+          import re
+          print(f"key id is plain A-Z0-9: {bool(re.fullmatch(r'[A-Z0-9]{10}', os.environ['ASC_KEY_ID'].strip()))}, issuer id is a plain uuid: {bool(re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', os.environ['ASC_ISSUER_ID'].strip()))}")
+          kid, iss, now = os.environ["ASC_KEY_ID"].strip(), os.environ["ASC_ISSUER_ID"].strip(), int(time.time())
+          # A team key signs with the issuer; an individual key (Users and
+          # Access → Integrations → Individual Keys) with sub "user" and no iss.
+          shapes = {"team key": {"iss": iss, "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+                    "individual key": {"sub": "user", "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"}}
+          for shape, claims in shapes.items():
+              try:
+                  token = sign_token(claims, key, kid)
+              except Exception as e:
+                  print(f"the .p8 does not load as a key: {type(e).__name__}"); raise SystemExit(1)
+              req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/bundleIds?limit=200&fields[bundleIds]=identifier", headers={"Authorization": f"Bearer {token}"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      ids = sorted(d["attributes"]["identifier"] for d in json.load(r)["data"])
+                      # Public log: say whether DockAI's ids exist, never list the team's apps.
+                      print(f"as a {shape}: 200 — DockAI bundle ids registered: {sum(1 for i in ids if i.endswith('.dockai') or '.dockai.' in i)}")
+              except urllib.error.HTTPError as e:
+                  errs = json.loads(e.read().decode() or "{}").get("errors", [{}])
+                  print(f"as a {shape}: {e.code} " + " | ".join(f"{x.get('code')}: {x.get('title')} — {x.get('detail')}" for x in errs))
+          PY
+      - name: Make sure the bundle ids and a device exist
+        if: env.HAS_KEY == 'true'
+        env:
+          BUNDLE_ID: com.polamoros.dockai
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        # Automatic signing makes a development profile while archiving, and
+        # Apple refuses one to a team with no devices. When there are none,
+        # register one placeholder (the owner's choice, 2026-09-25: it takes
+        # 1 of the year's 100 device slots). A team with a real device is
+        # left alone.
+        run: |
+          PYTHONPATH=ci python3 - <<'PY'
+          import os, time, json, urllib.request, urllib.error
+          from asc_jwt import team_token
+          token = team_token(os.environ["ASC_PRIVATE_KEY"], os.environ["ASC_KEY_ID"].strip(), os.environ["ASC_ISSUER_ID"].strip())
+          H = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+          def call(method, path, body=None):
+              req = urllib.request.Request("https://api.appstoreconnect.apple.com" + path, method=method, headers=H,
+                                           data=json.dumps(body).encode() if body else None)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+          # Every bundle id the archive signs, created here through the API
+          # when missing: Xcode's own registration of the watch ids failed
+          # with "Authentication failed" while the same key worked for the
+          # iPhone's (openspec/changes/watch-app). The App Group still has to
+          # be assigned to a new id in the developer portal — the API cannot.
+          base = os.environ["BUNDLE_ID"]
+          wanted = {base: "DockAI", base + ".widgets": "DockAI Widgets", base + ".notifications": "DockAI Notifications",
+                    base + ".watchkitapp": "DockAI Watch", base + ".watchkitapp.widgets": "DockAI Watch Widgets"}
+          have = {d["attributes"]["identifier"]: d["id"] for d in call("GET", "/v1/bundleIds?limit=200&fields[bundleIds]=identifier")["data"]}
+          for ident, name in wanted.items():
+              if ident in have:
+                  continue
+              try:
+                  made = call("POST", "/v1/bundleIds", {"data": {"type": "bundleIds", "attributes": {"identifier": ident, "name": name, "platform": "IOS"}}})
+                  call("POST", "/v1/bundleIdCapabilities", {"data": {"type": "bundleIdCapabilities", "attributes": {"capabilityType": "APP_GROUPS"},
+                       "relationships": {"bundleId": {"data": {"type": "bundleIds", "id": made["data"]["id"]}}}}})
+                  print(f"registered a new bundle id (1 of {len(wanted)}) with App Groups on — assign the group to it in the developer portal")
+              except urllib.error.HTTPError as e:
+                  errs = json.loads(e.read().decode() or "{}").get("errors", [{}])
+                  print(f"could not register a bundle id: {e.code} " + " | ".join(f"{x.get('code')}: {x.get('detail')}" for x in errs))
+          # Each run on a fresh runner makes Xcode create a development
+          # certificate whose private key dies with the runner. Remember which
+          # development certificates exist now; after the archive, the ones
+          # this run added are revoked — and nothing else, so certificates of
+          # other tools on the team are never touched (audit M4).
+          certs = call("GET", "/v1/certificates?limit=200&fields[certificates]=certificateType")["data"]
+          before = [c["id"] for c in certs if c["attributes"].get("certificateType") in ("DEVELOPMENT", "IOS_DEVELOPMENT")]
+          open(os.path.join(os.environ["RUNNER_TEMP"], "certs-before.json"), "w").write(json.dumps(before))
+          print(f"{len(before)} development certificate(s) before the archive")
+          devices = call("GET", "/v1/devices?filter[platform]=IOS&filter[status]=ENABLED&limit=200")["data"]
+          if devices:
+              print(f"team has {len(devices)} iOS device(s) — nothing to add")
+          else:
+              try:
+                  call("POST", "/v1/devices", {"data": {"type": "devices", "attributes": {
+                      "name": "DockAI CI placeholder", "platform": "IOS", "udid": "00008120-000D0C4A1C0FFEE1"}}})
+                  print("registered the placeholder device 'DockAI CI placeholder'")
+              except urllib.error.HTTPError as e:
+                  errs = json.loads(e.read().decode() or "{}").get("errors", [{}])
+                  print(f"could not register a device: {e.code} " + " | ".join(f"{x.get('code')}: {x.get('detail')}" for x in errs))
+                  raise SystemExit(1)
+          PY
+      - name: Archive and upload to TestFlight
+        if: env.HAS_KEY == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/asc-key.p8"
+          umask 077
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$KEY"
+          AUTH=(-allowProvisioningUpdates
+                -authenticationKeyPath "$KEY"
+                -authenticationKeyID "$ASC_KEY_ID"
+                -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          xcodebuild archive \
+            -project DockAI.xcodeproj -scheme DockAI -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/DockAI.xcarchive" \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            "${AUTH[@]}" 2>&1 | tee archive.log | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" || true
+          grep -q "ARCHIVE SUCCEEDED" archive.log
+          # The simulator tests' door (Credentials.load, #if DEBUG) must not be
+          # in what ships (audit L2).
+          if strings "$RUNNER_TEMP/DockAI.xcarchive/Products/Applications/DockAI.app/DockAI" | grep -q DOCKAI_TEST_SERVER; then
+            echo "The Release build contains the simulator test hook — refusing to upload."; exit 1
+          fi
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/DockAI.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            "${AUTH[@]}"
+          rm -f "$KEY"
+          echo "Uploaded build ${{ github.run_number }} to App Store Connect — it appears in TestFlight after Apple processes it." >> "$GITHUB_STEP_SUMMARY"
+      - name: Revoke the development certificate this run created
+        if: always() && env.HAS_KEY == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        # Its private key died with this runner, so it can never sign again;
+        # only certificates that did not exist before the archive, and made
+        # through the API, are revoked (audit M4).
+        run: |
+          PYTHONPATH=ci python3 - <<'PY'
+          import os, json, urllib.request
+          from asc_jwt import team_token
+          token = team_token(os.environ["ASC_PRIVATE_KEY"], os.environ["ASC_KEY_ID"].strip(), os.environ["ASC_ISSUER_ID"].strip())
+          H = {"Authorization": f"Bearer {token}"}
+          path = os.path.join(os.environ["RUNNER_TEMP"], "certs-before.json")
+          if not os.path.exists(path):
+              print("no record of the certificates before the archive — revoking nothing"); raise SystemExit(0)
+          before = set(json.load(open(path)))
+          req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/certificates?limit=200&fields[certificates]=certificateType,displayName,name", headers=H)
+          certs = json.load(urllib.request.urlopen(req, timeout=30))["data"]
+          mine = [c for c in certs
+                  if c["id"] not in before
+                  and c["attributes"].get("certificateType") in ("DEVELOPMENT", "IOS_DEVELOPMENT")
+                  and "Created via API" in ((c["attributes"].get("displayName") or "") + " " + (c["attributes"].get("name") or ""))]
+          for c in mine:
+              urllib.request.urlopen(urllib.request.Request("https://api.appstoreconnect.apple.com/v1/certificates/" + c["id"], method="DELETE", headers=H), timeout=30).close()
+          print(f"revoked {len(mine)} development certificate(s) this run created")
+          PY

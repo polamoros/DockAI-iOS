@@ -1,0 +1,211 @@
+# XcodeGen spec — generate the project with `xcodegen` (brew install xcodegen).
+# The .xcodeproj is not committed; this file is the source of truth.
+name: DockAI
+configFiles:
+  Debug: Config.xcconfig
+  Release: Config.xcconfig
+options:
+  bundleIdPrefix: com.polamoros
+  deploymentTarget:
+    iOS: "17.0"
+    watchOS: "10.0"
+  createIntermediateGroups: true
+packages:
+  # Pinned: the terminal code was written against 1.20.0, and SwiftTerm's main
+  # has since removed calls it uses (getTerminal()).
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    exactVersion: 1.20.0
+targets:
+  DockAI:
+    type: application
+    platform: iOS
+    sources: [DockAI]
+    dependencies:
+      - package: SwiftTerm
+      - target: DockAIWidgets
+        embed: true
+      - target: DockAINotifications
+        embed: true
+      # The Apple Watch companion (openspec/changes/watch-app), installed on
+      # the watch from the iPhone's Watch app.
+      - target: DockAIWatch
+        embed: true
+    entitlements:
+      path: DockAI/DockAI.entitlements
+      properties:
+        aps-environment: development
+        com.apple.security.application-groups: [$(DOCKAI_APP_GROUP)]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(DOCKAI_BUNDLE_ID)]
+    info:
+      path: DockAI/Info.plist
+      properties:
+        CFBundleDisplayName: DockAI
+        # Only the system's HTTPS: exempt, so App Store Connect stops asking
+        # the export-compliance question on every build.
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        NSCameraUsageDescription: DockAI scans the pairing code shown in Settings → Your devices.
+        NSFaceIDUsageDescription: DockAI can lock itself behind Face ID.
+        NSSupportsLiveActivities: true
+        UIBackgroundModes: [remote-notification]
+        DockAIAppGroup: $(DOCKAI_APP_GROUP)
+        # Plain http to local addresses only — the simulator tests' server on
+        # 127.0.0.1. The internet stays https-only.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        CFBundleURLTypes:
+          - CFBundleURLSchemes: [dockai]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(DOCKAI_BUNDLE_ID)
+        DEVELOPMENT_TEAM: $(DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.10"
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  DockAIWidgets:
+    type: app-extension
+    platform: iOS
+    sources: [DockAIWidgets, DockAI/Core]
+    entitlements:
+      path: DockAIWidgets/DockAIWidgets.entitlements
+      properties:
+        com.apple.security.application-groups: [$(DOCKAI_APP_GROUP)]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(DOCKAI_BUNDLE_ID)]
+    info:
+      path: DockAIWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: DockAI
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        DockAIAppGroup: $(DOCKAI_APP_GROUP)
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(DOCKAI_BUNDLE_ID).widgets
+        DEVELOPMENT_TEAM: $(DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.10"
+  DockAINotifications:
+    type: app-extension
+    platform: iOS
+    sources: [DockAINotifications]
+    entitlements:
+      path: DockAINotifications/DockAINotifications.entitlements
+      properties:
+        com.apple.security.application-groups: [$(DOCKAI_APP_GROUP)]
+    info:
+      path: DockAINotifications/Info.plist
+      properties:
+        CFBundleDisplayName: DockAI
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+        DockAIAppGroup: $(DOCKAI_APP_GROUP)
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(DOCKAI_BUNDLE_ID).notifications
+        DEVELOPMENT_TEAM: $(DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.10"
+  # ── Apple Watch (openspec/changes/watch-app) ───────────────────────────
+  # A single-target watch app, paired by the iPhone as its own device. It
+  # compiles only the portable shared files: the Live Activity type is
+  # iOS-only.
+  DockAIWatch:
+    type: application
+    platform: watchOS
+    sources:
+      - DockAIWatch
+      - DockAI/Core/JSON.swift
+      - DockAI/Core/TRPC.swift
+      - DockAI/Core/Keychain.swift
+    dependencies:
+      - target: DockAIWatchWidgets
+        embed: true
+    entitlements:
+      path: DockAIWatch/DockAIWatch.entitlements
+      properties:
+        com.apple.security.application-groups: [$(DOCKAI_APP_GROUP)]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(DOCKAI_BUNDLE_ID)]
+    info:
+      path: DockAIWatch/Info.plist
+      properties:
+        CFBundleDisplayName: DockAI
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: $(DOCKAI_BUNDLE_ID)
+        DockAIAppGroup: $(DOCKAI_APP_GROUP)
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(DOCKAI_BUNDLE_ID).watchkitapp
+        DEVELOPMENT_TEAM: $(DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.10"
+        TARGETED_DEVICE_FAMILY: "4"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  DockAIWatchWidgets:
+    type: app-extension
+    platform: watchOS
+    sources:
+      - DockAIWatchWidgets
+      - DockAI/Core/JSON.swift
+      - DockAI/Core/TRPC.swift
+      - DockAI/Core/Keychain.swift
+    entitlements:
+      path: DockAIWatchWidgets/DockAIWatchWidgets.entitlements
+      properties:
+        com.apple.security.application-groups: [$(DOCKAI_APP_GROUP)]
+        keychain-access-groups: [$(AppIdentifierPrefix)$(DOCKAI_BUNDLE_ID)]
+    info:
+      path: DockAIWatchWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: DockAI
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        DockAIAppGroup: $(DOCKAI_APP_GROUP)
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(DOCKAI_BUNDLE_ID).watchkitapp.widgets
+        DEVELOPMENT_TEAM: $(DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.10"
+  # ── Simulator UI tests (ci/mock-server.mjs; the workflow's simulator job) ──
+  DockAIUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [DockAIUITests]
+    dependencies:
+      - target: DockAI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(DOCKAI_BUNDLE_ID).uitests
+        TEST_TARGET_NAME: DockAI
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.10"
+  DockAIWatchUITests:
+    type: bundle.ui-testing
+    platform: watchOS
+    sources: [DockAIWatchUITests]
+    dependencies:
+      - target: DockAIWatch
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(DOCKAI_BUNDLE_ID).watchkitapp.uitests
+        TEST_TARGET_NAME: DockAIWatch
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.10"
+schemes:
+  DockAI:
+    build:
+      targets:
+        DockAI: all
+    test:
+      targets: [DockAIUITests]
+  DockAIWatch:
+    build:
+      targets:
+        DockAIWatch: all
+    test:
+      targets: [DockAIWatchUITests]

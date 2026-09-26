@@ -1,0 +1,7 @@
+// Edit these two, then run ./generate.sh.
+// Your Team ID: developer.apple.com → Membership.
+DEVELOPMENT_TEAM =
+DOCKAI_BUNDLE_ID = com.polamoros.dockai
+DOCKAI_APP_GROUP = group.$(DOCKAI_BUNDLE_ID)
+MARKETING_VERSION = 0.1.0
+CURRENT_PROJECT_VERSION = 1

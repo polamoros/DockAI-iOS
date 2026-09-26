@@ -1,0 +1,8 @@
+*.xcodeproj
+xcuserdata/
+DerivedData/
+.build/
+
+# The simulator test server writes its request log here.
+ci/out/
+__pycache__/
