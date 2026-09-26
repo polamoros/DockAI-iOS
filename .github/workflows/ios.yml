@@ -51,7 +51,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Use the newest Xcode (uploads need the iOS 26 SDK or later)
@@ -97,7 +97,7 @@ jobs:
     env:
       LIVE: ${{ inputs.live && '1' || '' }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Use the newest Xcode
@@ -232,7 +232,7 @@ jobs:
       - name: Secrets set?
         if: env.HAS_KEY != 'true'
         run: echo "No App Store Connect secrets yet — compile only." >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: env.HAS_KEY == 'true'
         with:
           persist-credentials: false
